@@ -219,12 +219,17 @@ def test_recv_timeout(kernel):
         sock.bind(address)
         sock.listen(1)
         results.append('accept wait')
+        print(1)
         client, addr = await sock.accept()
+        print(2)
         results.append('recv wait')
         try:
+            print(3)
             data = await timeout_after(0.5, client.recv(8192))
+            print(4)
             results.append('not here')
         except TaskTimeout:
+            print(5)
             results.append('recv timeout')
         await client.close()
         await sock.close()
@@ -372,3 +377,24 @@ def test_buffer_into(kernel):
     s2._socket.close()
 
     assert all(n==x for n,x in enumerate(results[0]))
+
+def test_read_write_on_same_socket(kernel):
+    async def main():
+        s1, s2 = socketpair()
+        t1 = await spawn(s1.recv(1000))
+        # Large enough send to trigger blocking:
+        N = 10000000
+        t2 = await spawn(s1.sendall(b"x" * N))
+        # In the old days, the above was enough to cause a crash, because we
+        # couldn't have two tasks blocked on the same socket simultaneously.
+        # Rest of this is just to clean up.
+        # Let t1 finish:
+        await s2.sendall(b"x")
+        # Let t2 finish:
+        n = 0
+        while n < N:
+            n += len(await s2.recv(N))
+        await t1.join()
+        await t2.join()
+
+    kernel.run(main())

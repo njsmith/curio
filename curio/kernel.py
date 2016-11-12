@@ -10,7 +10,7 @@ import sys
 import logging
 import signal
 from selectors import DefaultSelector
-from collections import deque, defaultdict
+from collections import deque, defaultdict, namedtuple
 
 # Logger where uncaught exceptions from crashed tasks are logged
 log = logging.getLogger(__name__)
@@ -29,6 +29,107 @@ from .local import _enable_tasklocal_for, _copy_tasklocal
 kqueue = deque
 
 # ----------------------------------------------------------------------
+# Wrapper around underlying selector API
+# ----------------------------------------------------------------------
+
+# There are two tricky issues with the stdlib 'selectors' API.
+# First, it works with a mapping:
+#
+#   fileno -> (read/write bitmask, opaque data tag)
+#
+# where there can only be one entry per fileno. But we can have arbitrarily
+# many different tasks interested in reading or writing to the same fileno,
+# and these can come and go independently. So this class adds a facade that
+# lets us register/unregister independent (fileno, event type, task)
+# interests, and then compiles that down into the selectors representation.
+#
+# Second, registering and unregistering an interest can be rather slow, and
+# it's rather common for a task to block repeatedly on the same interest. So
+# as an optimization, we apply a "debouncing filter": we batch up changes
+# waiting for select() to be called, and if we see a matching
+# unregister/register pair with no select call in between, then we can skip
+# them both. (XX FIXME: is this actually an optimization?)
+
+Interest = namedtuple("Interest", ["fd", "event", "task"])
+
+def _combined_flags(interests):
+    flags = 0
+    for interest in interests:
+        flags |= interest.event
+    return flags
+
+def _fileno(fileobj):
+    if isinstance(fileobj, int):
+        return fileobj
+    else:
+        return fileobj.fileno()
+
+class IOManager:
+    def __init__(self, selector):
+        self._selector = selector
+        # In the vast vast majority of cases, there will only be 1 or 2
+        # interests registered per fileno, so linear scans over interest sets
+        # are going to beat fancier data structures. (I guess this could bite
+        # you if you decide you want 1000 tasks all simultaneously
+        # reading/writing to the same file descriptor, but... really?)
+        self._fd_interests = {}
+        # Stores the read/write flags that are currently registered in the
+        # underlying selector, for fds that have been modified since the last
+        # time we called select. These are the ones that might need to be
+        # updated before we call select() again.
+        self._fd_old_flags = {}
+
+    def _get_interests_for_modification(self, fd):
+        # We have to work with integer filenos, because otherwise we can get
+        # aliasing between different file objects that have the same fileno
+        # and then all kinds of nasty stuff could happen.
+        assert isinstance(fd, int)
+        interests = self._fd_interests.setdefault(fd, set())
+        if fd not in self._fd_old_flags:
+            self._fd_old_flags[fd] = _combined_flags(interests)
+        return interests
+
+    def register(self, fileobj, event, task):
+        #print("register", fileobj, event, task)
+        fd = _fileno(fileobj)
+        interests = self._get_interests_for_modification(fd)
+        interests.add(Interest(fd, event, task))
+
+    def unregister(self, fileobj, event, task):
+        #print("unregister", fileobj, event, task)
+        fd = _fileno(fileobj)
+        interests = self._get_interests_for_modification(fd)
+        interests.remove(Interest(fd, event, task))
+        # Don't worry about cleaning up newly-empty interest sets -- it makes
+        # life easier to leave them alone for now, and handle them in select.
+
+    def select(self, timeout):
+        # print("entering select")
+        # print("fd_old_flags", self._fd_old_flags)
+        for fd, old_flags in self._fd_old_flags.items():
+            interests = self._fd_interests[fd]
+            if not interests:
+                del self._fd_interests[fd]
+            new_flags = _combined_flags(interests)
+            #print("adjusting flags", fd, old_flags, new_flags)
+            if old_flags != new_flags:
+                if not new_flags:
+                    self._selector.unregister(fd)
+                elif not old_flags:
+                    self._selector.register(fd, new_flags)
+                else:
+                    self._selector.modify(fd, new_flags)
+        self._fd_old_flags.clear()
+        for key, mask in self._selector.select(timeout):
+            for interest in list(self._fd_interests[key.fd]):
+                if interest.event & mask:
+                    yield interest.task
+                    self.unregister(*interest)
+
+    def close(self):
+        self._selector.close()
+
+# ----------------------------------------------------------------------
 # Underlying kernel that drives everything
 # ----------------------------------------------------------------------
 
@@ -38,7 +139,7 @@ class Kernel(object):
         if selector is None:
             selector = DefaultSelector()
 
-        self._selector = selector
+        self._iomanager = IOManager(selector)
         self._ready = kqueue()            # Tasks ready to run
         self._tasks = { }                 # Task table
         # Dict { signo: [ sigsets ] } of watched signals (initialized only if signals used)
@@ -71,7 +172,7 @@ class Kernel(object):
             Monitor(self)
 
     def __del__(self):
-        if self._selector is not None:
+        if self._iomanager is not None:
             raise RuntimeError('Curio kernel not properly terminated.  Please use Kernel.run(shutdown=True)')
 
     def __enter__(self):
@@ -138,9 +239,9 @@ class Kernel(object):
             self._signal_sets = None
             self._default_signals = None
 
-        if self._selector:
-            self._selector.close()
-            self._selector = None
+        if self._iomanager:
+            self._iomanager.close()
+            self._iomanager = None
 
         if self._thread_pool:
             self._thread_pool.shutdown()
@@ -159,13 +260,13 @@ class Kernel(object):
         tasks complete.
         '''
 
-        assert self._selector is not None, 'Kernel has been shut down'
+        assert self._iomanager is not None, 'Kernel has been shut down'
 
         # Motto:  "What happens in the kernel stays in the kernel"
 
         # ---- Kernel State
         current = None                          # Currently running task
-        selector = self._selector               # Event selector
+        iomanager = self._iomanager             # Event selector
         ready = self._ready                     # Ready queue
         tasks = self._tasks                     # Task table
         sleeping = self._sleeping               # Sleeping task queue
@@ -175,9 +276,9 @@ class Kernel(object):
         njobs = sum(not task.daemon for task in tasks.values())
 
         # ---- Bound methods
-        selector_register = selector.register
-        selector_unregister = selector.unregister
-        selector_select = selector.select
+        iomanager_register = iomanager.register
+        iomanager_unregister = iomanager.unregister
+        iomanager_select = iomanager.select
         ready_popleft = ready.popleft
         ready_append = ready.append
         ready_appendleft = ready.appendleft
@@ -367,20 +468,9 @@ class Kernel(object):
 
         # Wait for I/O
         def _trap_io(fileobj, event, state):
-            # See comment about deferred unregister in run().  If the requested
-            # I/O operation is *different* than the last I/O operation that was
-            # performed by the task, we need to unregister the last I/O resource used
-            # and register a new one with the selector.
-            if current._last_io != (state, fileobj):
-                if current._last_io:
-                    selector_unregister(current._last_io[1])
-                selector_register(fileobj, event, current)
-
-            # This step indicates that we have managed any deferred I/O management
-            # for the task.  Otherwise the run() method will perform an unregistration step.
-            current._last_io = None
+            iomanager_register(fileobj, event, current)
             current.state = state
-            current.cancel_func = lambda: selector_unregister(fileobj)
+            current.cancel_func = lambda task=current: iomanager_unregister(fileobj, event, task)
 
         # Wait on a Future
         def _trap_future_wait(future, event):
@@ -585,13 +675,7 @@ class Kernel(object):
             while not ready:
                 # Wait for an I/O event (or timeout)
                 timeout = (sleeping[0][0] - time_monotonic()) if sleeping else None
-                events = selector_select(timeout)
-
-                # Reschedule tasks with completed I/O
-                for key, mask in events:
-                    task = key.data
-                    # Please see comment regarding deferred_unregister in run()
-                    task._last_io = (task.state, key.fileobj)
+                for task in iomanager_select(timeout):
                     task.state = 'READY'
                     task.cancel_func = None
                     ready_append(task)
@@ -690,31 +774,6 @@ class Kernel(object):
                     # Execute the trap
                     assert type(trap[0]) is Traps
                     traps[trap[0]](*trap[1:])
-
-                finally:
-                    # Unregister previous I/O request. Discussion follows:
-                    #
-                    # When a task performs I/O, it registers itself with the underlying
-                    # I/O selector.  When the task is reawakened, it unregisters itself
-                    # and prepares to run.  However, in many network applications, the
-                    # task will perform a small amount of work and then go to sleep on
-                    # exactly the same I/O resource that it was waiting on before. For
-                    # example, a client handling task in a server will often spend most
-                    # of its time waiting for incoming data on a single socket.
-                    #
-                    # Instead of always unregistering the task from the selector, we
-                    # can defer the unregistration process until after the task goes
-                    # back to sleep again.  If it happens to be sleeping on the same
-                    # resource as before, there's no need to unregister it--it will
-                    # still be registered from the last I/O operation.
-                    #
-                    # The code here performs the unregister step for a task that
-                    # ran, but is now sleeping for a *different* reason than repeating the
-                    # prior I/O operation.  There is coordination with code in _trap_io().
-
-                    if current._last_io:
-                        selector_unregister(current._last_io[1])
-                        current._last_io = None
 
         # If kernel shutdown has been requested, issue a cancellation request to all remaining tasks
         if shutdown:
